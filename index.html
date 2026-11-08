@@ -58,6 +58,7 @@ a{color:inherit}
 .src i{width:7px;height:7px;border-radius:50%;background:var(--tx4)}
 .src.live i{background:var(--ok);box-shadow:0 0 0 3px rgba(74,222,128,.15)}
 .src.off i{background:var(--warn)}
+.src.check i{background:var(--warn)}
 .src.busy i{background:var(--ac);animation:pl 1s infinite}
 @keyframes pl{50%{opacity:.3}}
 
@@ -478,10 +479,17 @@ const CFG = (() => {
 })();
 const RAW = f => `https://raw.githubusercontent.com/${CFG.owner}/${CFG.repo}/HEAD/${encodeURIComponent(f)}`;
 const URLF = f => encodeURIComponent(f);
+// 本地缓存按仓库分开：同一个 xxx.github.io 下的所有仓库共用一个 localStorage，不分开就会串到别的仓库
+const LSP = `evo.${CFG.owner}/${CFG.repo}.`.toLowerCase();
 const LS = {
-  get(k, d) { try { const v = localStorage.getItem('evo.' + k); return v == null ? d : JSON.parse(v); } catch (e) { return d; } },
-  set(k, v) { try { localStorage.setItem('evo.' + k, JSON.stringify(v)); } catch (e) { } }
+  get(k, d) { try { const v = localStorage.getItem(LSP + k); return v == null ? d : JSON.parse(v); } catch (e) { return d; } },
+  set(k, v) { try { localStorage.setItem(LSP + k, JSON.stringify(v)); } catch (e) { } }
 };
+// 内置清单只属于 SFGFDSD/evowebos；部署到别的仓库时不用它当作品列表
+const HOME = (CFG.owner + '/' + CFG.repo).toLowerCase() === 'sfgfdsd/evowebos';
+// 页面和作品在同一个网站上（GitHub Pages）时，可以直接问网站某个文件在不在
+const SAME_ORIGIN = /^https?:$/.test(location.protocol);
+let LIST_STATE = 'ok';   // ok | loading | failed：作品列表为空时显示哪种提示
 
 /* ================= 厂商与配色（全部沿用原入口页的颜色） ================= */
 const COLLAB_C = '#2dd4bf';
@@ -651,8 +659,9 @@ function setSrc(state, label) {
   el.title = {
     live: '已从 GitHub 仓库实时读取文件列表：新作品上传后会自动出现',
     cache: '使用本地缓存的 GitHub 文件列表',
-    off: 'GitHub API 暂不可用（离线或超出每小时 60 次限额），使用内置清单',
-    busy: '正在从 GitHub 同步文件列表…', snap: '内置清单'
+    off: 'GitHub API 暂不可用（离线或超出每小时 60 次限额）',
+    check: 'GitHub API 暂不可用（多半是超出每小时 60 次限额）。已逐个向网站核对文件，只显示仓库里确实存在的作品；新上传的作品要等 API 恢复后才会出现',
+    busy: '正在从 GitHub 同步文件列表…', snap: '内置清单，正在核对仓库'
   }[state] || '';
 }
 async function syncTree(force) {
@@ -662,11 +671,12 @@ async function syncTree(force) {
     const h = { Accept: 'application/vnd.github+json' };
     if (cache && cache.etag && !force) h['If-None-Match'] = cache.etag;
     let r = await fetch(`https://api.github.com/repos/${CFG.owner}/${CFG.repo}/git/trees/HEAD?recursive=1`, { headers: h, cache: 'no-store' });
+    LIST_STATE = 'ok';
     if (r.status === 304 && cache) { setWorks(cache.list, 'live', `GitHub 实时 · ${W.length} 件`); render(); fillUploadTimes(); return; }
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const j = await r.json();
     const list = (j.tree || []).filter(t => t.type === 'blob' && !t.path.includes('/') && RE_FILE.test(t.path)).map(t => [t.path, t.size]);
-    if (!list.length) throw new Error('empty');
+    if (!list.length) { LIST_STATE = 'empty'; LS.set('tree', { etag: r.headers.get('ETag'), at: Date.now(), list }); setWorks([], 'live', 'GitHub 实时 · 0 件'); render(); return; }
     LS.set('tree', { etag: r.headers.get('ETag'), at: Date.now(), list });
     const before = new Set(W.map(w => w.file));
     setWorks(list, 'live', `GitHub 实时 · ${list.length} 件`);
@@ -674,10 +684,43 @@ async function syncTree(force) {
     if (added && before.size) toast(`同步完成：发现 ${added} 件新作品`);
     render(); fillUploadTimes();
   } catch (e) {
-    if (cache) setSrc('cache', `缓存清单 · ${W.length} 件`);
-    else setSrc('off', `内置清单 · ${W.length} 件`);
     console.warn('GitHub 同步失败', e);
+    await fallbackList(cache);
   }
+}
+// GitHub API 用不了时的后备：候选 = 这个仓库的缓存 + 网站上的 works-stats.json + 内置清单（仅 evowebos），
+// 再向网站逐个确认文件存在（HEAD 请求，不占 API 额度），只留下真实存在的作品
+async function fallbackList(cache) {
+  const cand = new Map();
+  const add = (f, s, u) => { if (RE_FILE.test(f) && !f.includes('/') && !cand.has(f)) cand.set(f, [f, s ?? null, u ?? null]); };
+  if (cache && cache.list) cache.list.forEach(x => add(x[0], x[1], x[2]));
+  try { const r = await fetch('works-stats.json', { cache: 'no-store' }); if (r.ok) { const j = await r.json(); for (const [f, v] of Object.entries(j.works || {})) add(f, v.s, v.u); } } catch (e) { }
+  if (HOME) SNAP.forEach(x => add(x[0], x[1], x[2]));
+  let list = [...cand.values()];
+  if (SAME_ORIGIN && list.length) {
+    setSrc('busy', `核对文件中… 0/${list.length}`);
+    const ok = new Array(list.length).fill(null); let i = 0, done = 0;
+    const one = async () => {
+      while (i < list.length) {
+        const k = i++;
+        try { const r = await fetch(URLF(list[k][0]), { method: 'HEAD', cache: 'no-store' }); ok[k] = r.ok; }
+        catch (e) { ok[k] = null; }      // 网络错误：不知道在不在，先保留
+        if (++done % 10 === 0) setSrc('busy', `核对文件中… ${done}/${list.length}`);
+      }
+    };
+    await Promise.all(Array.from({ length: 8 }, one));
+    if (ok.every(v => v === null)) {      // 整个网站都连不上（离线）：只能用这个仓库自己的缓存
+      list = cache && cache.list ? cache.list : [];
+      LIST_STATE = list.length ? 'ok' : 'failed';
+      setWorks(list, 'off', list.length ? `离线 · 缓存清单 ${list.length} 件` : '离线 · 读不到作品清单'); render(); return;
+    }
+    list = list.filter((x, k) => ok[k] !== false);
+    // 核对过的清单存回缓存（etag 清空，API 恢复后会重新完整读取）
+    if (list.length) LS.set('tree', { etag: null, at: Date.now(), list });
+  } else if (!SAME_ORIGIN) list = cache && cache.list ? cache.list : (HOME ? SNAP : []);
+  LIST_STATE = list.length ? 'ok' : 'failed';
+  setWorks(list, 'check', list.length ? `已核对 · ${list.length} 件` : '读不到作品清单');
+  render();
 }
 
 /* ================= 上传时间（同一天的作品按它排先后） ================= */
@@ -1064,6 +1107,15 @@ function renderRes() {
   const el = $('#res');
   el.classList.toggle('anim', firstRender || el.dataset.view !== S.view);
   el.dataset.view = S.view; firstRender = false;
+  if (!W.length && S.view !== 'dash') {
+    const msg = {
+      loading: ['正在从 GitHub 读取作品清单…', `仓库 ${esc(CFG.owner)}/${esc(CFG.repo)}`],
+      empty: ['这个仓库里还没有作品', `按「模型 作品 YYYY.MM.DD 名称 v版本.html」命名上传到 ${esc(CFG.owner)}/${esc(CFG.repo)} 根目录，刷新就会出现`],
+      failed: ['暂时读不到作品清单', 'GitHub API 暂不可用（离线或超出每小时 60 次限额），稍后再试']
+    }[LIST_STATE] || ['还没有作品', ''];
+    el.innerHTML = `<div class="empty">${ic('empty', 1.5)}<div style="font-size:15px;color:var(--tx2);margin-bottom:6px">${msg[0]}</div><div>${msg[1]}</div>${LIST_STATE === 'failed' ? '<div style="margin-top:14px"><button class="btn sm" data-resync>重试</button></div>' : ''}</div>`;
+    return;
+  }
   if (!VIEW.length && S.view !== 'dash') {
     el.innerHTML = `<div class="empty">${ic('empty', 1.5)}<div style="font-size:15px;color:var(--tx2);margin-bottom:6px">没有符合条件的作品</div><div>试试放宽筛选条件</div><div style="margin-top:14px"><button class="btn sm" data-acall>清除全部筛选</button></div></div>`;
     return;
@@ -1247,6 +1299,7 @@ function bind() {
   // 结果头
   $('#rh').addEventListener('click', e => {
     const a = e.target.closest('[data-ac]'); if (a) { ACT[+a.dataset.ac].fn(); return update(); }
+    if (e.target.closest('[data-resync]')) { LIST_STATE = 'loading'; render(); return syncTree(true); }
     if (e.target.closest('[data-acall]')) { Object.assign(S, JSON.parse(JSON.stringify(DEF)), { sort: S.sort, grp: S.grp, view: S.view, dense: S.dense }); $('#q').value = ''; return update(); }
     if (e.target.closest('#dense')) { S.dense = S.dense ? 0 : 1; return update(); }
   });
@@ -1789,7 +1842,8 @@ function init() {
   const h = readHash(); $('#q').value = S.q;
   const cache = LS.get('tree', null);
   if (cache && cache.list && cache.list.length) setWorks(cache.list, 'cache', `缓存清单 · ${cache.list.length} 件`);
-  else setWorks(SNAP, 'snap', `内置清单 · ${SNAP.length} 件`);
+  else if (HOME) setWorks(SNAP, 'snap', `内置清单 · ${SNAP.length} 件`);
+  else { LIST_STATE = 'loading'; setWorks([], 'busy', '正在读取仓库…'); }
   render();
   if (h.cmp) { const c = h.cmp.split('~').filter(f => BY.has(f)).slice(0, 4); if (c.length >= 2) { CMP = c; openCompare(); } }
   else if (h.open && BY.has(h.open)) openViewer(h.open);
@@ -1799,5 +1853,5 @@ function init() {
 init();
 
 </script>
-</body>
+<script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a575b8edac3bec6b',t:'MTc5NDE1MjkxMA=='};var l=window.parent.location,o;try{o=new URL(l.origin).origin}catch(e){try{o=new URL(new URL(l.href).origin).origin}catch(e){o=''}}var u='/cdn-cgi/challenge-platform/scripts/jsd/main.js?ray=a575b8edac3bec6b',a=document.createElement('script');a.src=o?new URL(u,o).href:u;document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
 </html>
